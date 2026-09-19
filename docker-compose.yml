@@ -1,6 +1,8 @@
 services:
   api:
-    build: ./api
+    build:
+      context: ./api
+      target: runtime
     ports:
       - "${API_PORT:-8000}:8000"
     healthcheck:
@@ -13,6 +15,15 @@ services:
       timeout: 3s
       retries: 12
       start_period: 5s
+
+  # 一次性回归服务：用交付镜像同一 CPython 与 app.scanner 跑 api 单元测试
+  # （含暴力最优性对照、稳定决胜检查与无冲突扫描内存回归），跑完即退出，
+  # 退出码即回归结果；verify 仅在它成功退出后才会启动。
+  api-tests:
+    build:
+      context: ./api
+      target: test
+    restart: "no"
 
   web:
     build: ./web
@@ -36,6 +47,8 @@ services:
         condition: service_healthy
       web:
         condition: service_healthy
+      api-tests:
+        condition: service_completed_successfully
     environment:
       API_URL: http://api:8000
       WEB_URL: http://web

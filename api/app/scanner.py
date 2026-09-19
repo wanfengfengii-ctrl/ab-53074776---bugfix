@@ -187,34 +187,53 @@ def _channel_isolation_indices(items: list[tuple[int, Cue]]) -> list[int]:
     if m < 2:
         return []
 
-    # 第三优先级用位权编码：源下标越小位权越大，等数量前提下
-    # "被隔离下标升序序列字典序更小" 等价于被隔离集合的位权总和更大。
-    bit_of = {
-        index: 1 << (m - 1 - pos)
-        for pos, (index, _) in enumerate(sorted(items, key=lambda pair: pair[0]))
-    }
-
     # 按终点升序做加权区间调度；终点相同再按起点、源下标，保证扫描顺序确定。
     seq = sorted(items, key=lambda pair: (pair[1].end_ms, pair[1].start_ms, pair[0]))
     ends = [cue.end_ms for _, cue in seq]
+    src = [index for index, _ in seq]
 
-    # dp 状态：只考虑 seq 前 i 个时的最优 (保留数, 保留总时长, 被隔离位权和)。
+    # dp 状态：只考虑 seq 前 i 个时的最优 (保留数, 保留总时长)。
     count = [0] * (m + 1)
     kept_ms = [0] * (m + 1)
-    dropped_bits = [0] * (m + 1)
+    # 第三优先级（被隔离下标升序序列字典序更小者优）不再展开成位权大整数：
+    # 那会为每个 cue 各存一个长达 m 位的整数，总位数 Θ(m²)，即使最终无需隔离
+    # 任何 cue 也占用二次方工作集。这里改为可回溯链：pred[i] 是前驱状态，
+    # 状态 i 相对前驱新增隔离 seq[pred[i]:add_hi[i]]（按 seq 下标的半开区间）。
+    # 沿链各区间互不重叠，单条链覆盖的元素总数不超过 m，全部状态仅占线性空间。
+    pred = [0] * (m + 1)
+    add_hi = [0] * (m + 1)
+
+    def dropped_sorted(p: int, hi: int) -> list[int]:
+        """候选方案 (前驱状态 p, 新增隔离 seq[p:hi]) 的被隔离源下标升序列表。"""
+        dropped = src[p:hi]
+        while p:
+            dropped.extend(src[pred[p]:add_hi[p]])
+            p = pred[p]
+        dropped.sort()
+        return dropped
+
     for i in range(1, m + 1):
-        index, cue = seq[i - 1]
+        cue = seq[i - 1][1]
         duration = cue.end_ms - cue.start_ms
         # 半开区间：终点 <= 当前起点即兼容（端点相接可共存）。
         compatible = bisect_right(ends, cue.start_ms, 0, i - 1)
         # 方案一：隔离当前 cue。
-        skip = (count[i - 1], kept_ms[i - 1], dropped_bits[i - 1] | bit_of[index])
+        skip = (count[i - 1], kept_ms[i - 1])
         # 方案二：保留当前 cue，排在其后且与之相叠的中间项全部隔离。
-        keep_bits = dropped_bits[compatible]
-        for k in range(compatible, i - 1):
-            keep_bits |= bit_of[seq[k][0]]
-        keep = (count[compatible] + 1, kept_ms[compatible] + duration, keep_bits)
-        count[i], kept_ms[i], dropped_bits[i] = max(skip, keep)
+        keep = (count[compatible] + 1, kept_ms[compatible] + duration)
+        if skip > keep:
+            count[i], kept_ms[i] = skip
+            pred[i], add_hi[i] = i - 1, i
+        elif keep > skip:
+            count[i], kept_ms[i] = keep
+            pred[i], add_hi[i] = compatible, i - 1
+        elif dropped_sorted(i - 1, i) <= dropped_sorted(compatible, i - 1):
+            # 数量与时长并列：被隔离下标升序序列字典序更小者优
+            # （等数量集合的比较等价于位权总和比较，但无需保存位图）。
+            count[i], kept_ms[i] = skip
+            pred[i], add_hi[i] = i - 1, i
+        else:
+            count[i], kept_ms[i] = keep
+            pred[i], add_hi[i] = compatible, i - 1
 
-    final_bits = dropped_bits[m]
-    return sorted(index for index, bit in bit_of.items() if final_bits & bit)
+    return dropped_sorted(pred[m], add_hi[m])

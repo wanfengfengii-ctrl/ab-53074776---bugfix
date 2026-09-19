@@ -39,6 +39,10 @@ docker compose up --build --exit-code-from verify verify
 `verify` 等待 web/api 健康后，对真实运行的服务发 HTTP 请求跑完整验收
 （含经 web 层 nginx 代理的 `/api/analyze` 全链路），跑完即退出，退出码即验收结果。
 
+验收链路还包含一次性回归服务 `api-tests`：它使用与交付镜像相同的 CPython 和
+`app.scanner` 先跑完 api 单元测试（含暴力最优性对照、稳定决胜检查，以及无冲突
+扫描内存随 cue 数量近似线性增长的回归），仅在其以退出码 0 完成后 `verify` 才会启动。
+
 ## cue 文件格式与规则
 
 文件必须是 UTF-8 编码的 JSON 数组，每个元素恰好四个字段：

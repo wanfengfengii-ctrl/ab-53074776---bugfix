@@ -1,4 +1,5 @@
 __pycache__
 .pytest_cache
-tests
-requirements-dev.txt
+# tests/ 与 requirements-dev.txt 需保留在构建上下文内：
+# Dockerfile 的 test 阶段（compose 的 api-tests 回归服务）会 COPY 它们；
+# 交付的 runtime 阶段不 COPY，镜像内容不受影响。
