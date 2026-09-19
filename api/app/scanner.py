@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from array import array
 from bisect import bisect_right
 from dataclasses import dataclass, field
 
@@ -187,34 +188,125 @@ def _channel_isolation_indices(items: list[tuple[int, Cue]]) -> list[int]:
     if m < 2:
         return []
 
-    # 第三优先级用位权编码：源下标越小位权越大，等数量前提下
-    # "被隔离下标升序序列字典序更小" 等价于被隔离集合的位权总和更大。
-    bit_of = {
-        index: 1 << (m - 1 - pos)
-        for pos, (index, _) in enumerate(sorted(items, key=lambda pair: pair[0]))
-    }
-
     # 按终点升序做加权区间调度；终点相同再按起点、源下标，保证扫描顺序确定。
     seq = sorted(items, key=lambda pair: (pair[1].end_ms, pair[1].start_ms, pair[0]))
     ends = [cue.end_ms for _, cue in seq]
 
-    # dp 状态：只考虑 seq 前 i 个时的最优 (保留数, 保留总时长, 被隔离位权和)。
+    # 第三优先级“被隔离下标升序序列字典序更小”等价于
+    # “保留集合（数量恒定为 m-k）的降序下标序列字典序更大”（取补集翻转）。
+    # DP 只追踪保留集合：每次保留只是在兼容前缀的链尾追加一个区间，
+    # 天然是单链追加而非位图并入，因此可用结构共享的持久化集合表示，
+    # 工作集随 cue 数量线性增长，不再为每个 cue 保存 Θ(m) 位的大整数。
+    ranks = _KeptSetRanks(seq)
+
+    # dp[i]：只考虑 seq 前 i 个时的最优保留方案
+    #   (保留数, 保留总时长, 保留集合节点)，逐元素 O(log m) 决胜。
+    # decision[i]/parent[i] 记录最优选择以便结尾一次性回溯，
+    # 二者总长度均为 O(m)，不保留任何二次方位图。
     count = [0] * (m + 1)
     kept_ms = [0] * (m + 1)
-    dropped_bits = [0] * (m + 1)
+    node_of = [0] * (m + 1)
+    decision = bytearray(m + 1)  # 1 = 保留 seq[i-1]；0 = 隔离
+    parents = array("i", [-1]) * (m + 1)
+
     for i in range(1, m + 1):
         index, cue = seq[i - 1]
         duration = cue.end_ms - cue.start_ms
         # 半开区间：终点 <= 当前起点即兼容（端点相接可共存）。
         compatible = bisect_right(ends, cue.start_ms, 0, i - 1)
-        # 方案一：隔离当前 cue。
-        skip = (count[i - 1], kept_ms[i - 1], dropped_bits[i - 1] | bit_of[index])
-        # 方案二：保留当前 cue，排在其后且与之相叠的中间项全部隔离。
-        keep_bits = dropped_bits[compatible]
-        for k in range(compatible, i - 1):
-            keep_bits |= bit_of[seq[k][0]]
-        keep = (count[compatible] + 1, kept_ms[compatible] + duration, keep_bits)
-        count[i], kept_ms[i], dropped_bits[i] = max(skip, keep)
+        # 方案一：隔离当前 cue，方案与 dp[i-1] 相同。
+        skip = (count[i - 1], kept_ms[i - 1], node_of[i - 1])
+        # 方案二：保留当前 cue：其按终点早于/等于它且相容的区间
+        # （恰为 seq[:compatible] 中的最优保留集）之后追加当前项。
+        keep_node = ranks.append(node_of[compatible], index)
+        keep = (count[compatible] + 1, kept_ms[compatible] + duration, keep_node)
+        if skip > keep:
+            count[i], kept_ms[i], node_of[i] = skip
+            decision[i] = 0
+            parents[i] = i - 1
+        else:
+            count[i], kept_ms[i], node_of[i] = keep
+            decision[i] = 1
+            parents[i] = compatible
 
-    final_bits = dropped_bits[m]
-    return sorted(index for index, bit in bit_of.items() if final_bits & bit)
+    # 沿决策链回溯：dp[i] 选保留则收集该 cue，再跳到其兼容前缀状态。
+    dropped: list[int] = []
+    i = m
+    while i > 0:
+        if decision[i]:
+            i = parents[i]
+        else:
+            dropped.append(seq[i - 1][0])
+            i -= 1
+    dropped.sort()
+    return dropped
+
+
+class _KeptSet:
+    """按源下标排序的持久化（结构共享）保留集合，仅支持“取某版本 + 追加一项”。
+
+    叶子按源下标升序编号；节点严格对应树的固定层级（空子树统一为节点 0），
+    内容相同的节点经 hash-consing 得到相同 id。于是第三层决胜
+    “降序下标序列字典序更大”只需沿右子树优先下降到首个存在性不同的叶子，
+    单次 O(log m)，无需还原集合或比较位图。
+
+    m 次 append 恰好创建 m·log2(size) 个节点，每个节点在三个 array('i')
+    中占 12 字节；规范化字典的键编码为单个整数。总工作集 O(m log m)
+    （实际接近线性），不再出现总位数 Θ(m²) 的大整数位图。
+    """
+
+    __slots__ = ("size", "depth", "rank_of", "left", "right", "intern", "shift")
+
+    def __init__(self, seq: list[tuple[int, Cue]]) -> None:
+        m = len(seq)
+        self.size = 1 << max(1, (m - 1).bit_length())
+        self.depth = self.size.bit_length()
+        # 源下标 → 叶子名次（下标越小名次越小）。
+        self.rank_of = {
+            index: rank
+            for rank, (index, _) in enumerate(sorted(seq, key=lambda pair: pair[0]))
+        }
+        # 节点 0 表示任意层级的空子树（left/right 均指向自身）。
+        self.left = array("i", [0])
+        self.right = array("i", [0])
+        # 每次 append 新建恰好 depth 个节点；据此给 intern 键留出足够位数。
+        max_nodes = m * self.depth + 1
+        self.shift = max(1, (max_nodes - 1).bit_length())
+        self.intern: dict[int, int] = {}
+
+    def _node(self, left: int, right: int) -> int:
+        key = (left << self.shift) | right
+        node = self.intern.get(key)
+        if node is None:
+            node = len(self.left)
+            self.intern[key] = node
+            self.left.append(left)
+            self.right.append(right)
+        return node
+
+    def append(self, root: int, index: int) -> int:
+        """返回在 root 版本中加入源下标 index 后的新版本根。"""
+        target = self.rank_of[index]
+
+        def build(node: int, lo: int, hi: int) -> int:
+            if hi - lo == 1:
+                return self._node(0, 0)  # 规范化叶子：右兄弟为 0 即表示叶子
+            mid = (lo + hi) >> 1
+            if target < mid:
+                return self._node(build(self.left[node], lo, mid), self.right[node])
+            return self._node(self.left[node], build(self.right[node], mid, hi))
+
+        return build(root, 0, self.size)
+
+    def prefer(self, winner: int, other: int) -> bool:
+        """winner 的降序源下标序列是否字典序严格大于 other（同数量前提下决胜）。"""
+        lo, hi = 0, self.size
+        while winner != other and hi - lo > 1:
+            mid = (lo + hi) >> 1
+            wr, oth = self.right[winner], self.right[other]
+            if wr != oth:
+                # 右半侧（源下标更大的一半）已有差异，最高差异叶子必在其中。
+                winner, other, lo = wr, oth, mid
+            else:
+                winner, other, hi = self.left[winner], self.left[other], mid
+        return winner != 0
